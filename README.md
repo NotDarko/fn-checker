@@ -3,13 +3,13 @@ Edited by [Darko](https://discord.com/users/1070772570942623764)
 
 ## Capture Features
 
-`🎈` Exclusive and rare items
+`🎈` Exclusive and rares
 `🎈` 2FA status
 `🎈` Skin count
 `🎈` V-Bucks balance
 `🎈` FA or NFA
-`🎈` Last match info
-`🎈` Plus more <br>
+`🎈` Last Played
+`🎈` And more <br>
 
 ## Setup
 
