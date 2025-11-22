@@ -1,19 +1,22 @@
-`💎` - OmesFN<br>
-<br>
-# Capture
-`🎈` Exclusive<br>
-`🎈` 2FA<br>
-`🎈` Skin Count<br>
-`🎈` FA or NFA<br>
-`🎈` Last Game<br>
-`🎈` And more !<br>
+`💎` **OmesFN**
+Edited by [Darko](https://discord.com/users/1070772570942623764)
 
+## Capture Features
 
-# Setup
-`📦` Install [Go](https://go.dev/doc/install)<br>
-`📦` Open commands<br>
-`📦` Run go build<br>
+`🎈` Exclusive and rare items
+`🎈` 2FA status
+`🎈` Skin count
+`🎈` V-Bucks balance
+`🎈` FA or NFA
+`🎈` Last match info
+`🎈` Plus more <br>
 
+## Setup
 
-# Screenshot
-![Screenshot](https://media.discordapp.net/attachments/1429459924467056703/1430305197560696874/image.png?ex=68f94b04&is=68f7f984&hm=b6d03c3aaaee88924d08a12a3baee7b7fa1b3dce7816fc586152647f78e114ca&=&format=webp&quality=lossless&width=1325&height=744)
+`📦` Install [Go](https://go.dev/doc/install)
+`📦` Open your command line
+`📦` Run `go build` <br>
+
+## Screenshot
+
+![Screenshot](https://media.discordapp.net/attachments/1428366000449126542/1441727491873177711/image.png?ex=6922d8dc\&is=6921875c\&hm=ca03b249beabb0f0847734e880a12d5e181dc18a86ab11312e1a4b11c4447f0c&=\&format=png\&quality=lossless\&width=528\&height=420)
