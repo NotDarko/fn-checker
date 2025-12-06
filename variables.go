@@ -52,6 +52,7 @@ var (
 
 	ThreadCount int  = 0
 	DebugMode   bool = false
+	ProxylessMaxThreads int = 10
 
 	Username    string = ""
 	LicenseKey  string = ""
