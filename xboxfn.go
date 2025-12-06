@@ -732,29 +732,30 @@ func CheckAccount(acc string) bool {
     GetStats().getSessionFolder()
     var authResp *http.Response
     var authBody string
-    for {
-        authURL := "https://login.live.com/ppsecure/post.srf?client_id=82023151-c27d-4fb5-8551-10c10724a55e&contextid=A31E247040285505&opid=F7304AA192830107&bk=1701944501&uaid=a7afddfca5ea44a8a2ee1bba76040b3c&pid=15216"
-        authHeaders := map[string]string{
-            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-            "accept-encoding": "gzip, deflate, br",
-            "accept": "*/*",
-            "connection": "keep-alive",
-            "accept-language": "en,en-US;q=0.9,en;q=0.8",
-            "cache-control": "max-age=0",
-            "content-type": "application/x-www-form-urlencoded",
-            "cookie": cookieValue,
-            "host": "login.live.com",
-            "origin": "https://login.live.com",
-            "referer": "https://login.live.com/oauth20_authorize.srf?client_id=82023151-c27d-4fb5-8551-10c10724a55e&redirect_uri=https%3A%2F%2Faccounts.epicgames.com%2FOAuthAuthorized&state=eyJpZCI6IjAzZDZhYmM1NDIzMjQ2Yjg5MWNhYmM2ODg0ZGNmMGMzIn0%3D&scope=xboxlive.signin&service_entity=undefined&force_verify=true&response_type=code&display=popup",
-            "sec-fetch-dest": "document",
-            "sec-fetch-mode": "navigate",
-            "sec-fetch-site": "same-origin",
-            "sec-fetch-user": "?1",
-            "upgrade-insecure-requests": "1",
-            "sec-ch-ua": "\"Not_A Brand\";v=\"99\", \"Google Chrome\";v=\"137\", \"Chromium\";v=\"137\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Windows\"",
-        }
+    authURL := "https://login.live.com/ppsecure/post.srf?client_id=82023151-c27d-4fb5-8551-10c10724a55e&contextid=A31E247040285505&opid=F7304AA192830107&bk=1701944501&uaid=a7afddfca5ea44a8a2ee1bba76040b3c&pid=15216"
+    authHeaders := map[string]string{
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "accept-encoding": "gzip, deflate, br",
+        "accept": "*/*",
+        "connection": "keep-alive",
+        "accept-language": "en,en-US;q=0.9,en;q=0.8",
+        "cache-control": "max-age=0",
+        "content-type": "application/x-www-form-urlencoded",
+        "cookie": cookieValue,
+        "host": "login.live.com",
+        "origin": "https://login.live.com",
+        "referer": "https://login.live.com/oauth20_authorize.srf?client_id=82023151-c27d-4fb5-8551-10c10724a55e&redirect_uri=https%3A%2F%2Faccounts.epicgames.com%2FOAuthAuthorized&state=eyJpZCI6IjAzZDZhYmM1NDIzMjQ2Yjg5MWNhYmM2ODg0ZGNmMGMzIn0%3D&scope=xboxlive.signin&service_entity=undefined&force_verify=true&response_type=code&display=popup",
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+        "sec-ch-ua": "\"Not_A Brand\";v=\"99\", \"Google Chrome\";v=\"137\", \"Chromium\";v=\"137\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"Windows\"",
+    }
+    maxAuthAttempts := 5
+    for attempt := 1; attempt <= maxAuthAttempts; attempt++ {
         data := url.Values{}
         data.Set("i13", "0")
         data.Set("login", email)
@@ -789,26 +790,47 @@ func CheckAccount(acc string) bool {
             req.Header.Set(key, value)
         }
         authResp, err2 = session.Do(req)
-        if err2 == nil && authResp.StatusCode == 200 {
-            break
+        if err2 != nil {
+            LogError(fmt.Sprintf("Error during authentication for %s: %v", acc, err2))
+            time.Sleep(time.Duration(attempt) * time.Second)
+            continue
         }
-        if authResp != nil && authResp.StatusCode != 200 {
+        authBody, err2 = readResponseBody(authResp)
+        if err2 != nil {
+            authResp.Body.Close()
+            GetStats().ExportRetries(acc, "failed to read auth response", true)
+            return false
+        }
+        lowerAuthBody := strings.ToLower(authBody)
+        if authResp.StatusCode == 429 || strings.Contains(lowerAuthBody, "retry with a different device") {
+            authResp.Body.Close()
+            if attempt == maxAuthAttempts {
+                GetStats().ExportRetries(acc, "rate limited during authentication", false)
+                return false
+            }
+            time.Sleep(time.Duration(attempt*2) * time.Second)
+            continue
+        }
+        if authResp.StatusCode != 200 {
+            authResp.Body.Close()
+            if authResp.StatusCode >= 500 {
+                if attempt < maxAuthAttempts {
+                    time.Sleep(time.Duration(attempt) * time.Second)
+                    continue
+                }
+                GetStats().ExportRetries(acc, fmt.Sprintf("auth HTTP %d", authResp.StatusCode), false)
+                return false
+            }
             GetStats().ExportBads(acc, fmt.Sprintf("HTTP %d", authResp.StatusCode))
             return false
         }
-        if strings.Contains(err2.Error(), "ConnectionError") || strings.Contains(err2.Error(), "Timeout") {
-            time.Sleep(2 * time.Second)
-            continue
-        }
-        LogError(fmt.Sprintf("Error during authentication for %s: %v", acc, err2))
-        continue
+        break
     }
-    defer authResp.Body.Close()
-    authBody, err2 = readResponseBody(authResp)
-    if err2 != nil {
-        LogError(fmt.Sprintf("Error reading auth response body for %s: %v", acc, err2))
+    if authResp == nil || authBody == "" {
+        GetStats().ExportRetries(acc, "empty auth response", true)
         return false
     }
+    defer authResp.Body.Close()
     debugLog("Microsoft authentication response for %s: %s", acc, authBody)
     if strings.Contains(strings.ToLower(authBody), "abuse?mkt=") || strings.Contains(strings.ToLower(authBody), "recover?mkt=") {
         LogError(fmt.Sprintf("Account %s got abuse/recover response in Microsoft auth, marking as bad", acc))
@@ -940,15 +962,6 @@ func CheckAccount(acc string) bool {
                     logResponseToFile(acc, "cancel?mkt_GET", responseBody)
                 }
             }
-        }
-    }
-    if authResp.StatusCode == 429 || strings.Contains(authBody, "retry with a different device") {
-        if !UseProxies || len(Proxies) == 0 {
-            time.Sleep(2 * time.Second)
-            return false
-        } else {
-            GetStats().ExportRetries(acc, "rate limited", false)
-            return false
         }
     }
     if authResp == nil || authResp.StatusCode != 200 {
